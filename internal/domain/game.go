@@ -1,0 +1,285 @@
+package domain
+
+import (
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/notnil/chess"
+)
+
+type GameStatus string
+
+const (
+	StatusWaiting    GameStatus = "WAITING"
+	StatusInProgress GameStatus = "IN_PROGRESS"
+	StatusCompleted  GameStatus = "COMPLETED"
+	StatusAbandoned  GameStatus = "ABANDONED"
+	StatusDraw       GameStatus = "DRAW"
+)
+
+type GameWinner string
+
+const (
+	WinnerWhite GameWinner = "WHITE"
+	WinnerBlack GameWinner = "BLACK"
+	WinnerDraw  GameWinner = "DRAW"
+)
+
+type ChessGame struct {
+	ID            string      `json:"id"`
+	WhitePlayerID string      `json:"whitePlayerId"`
+	BlackPlayerID string      `json:"blackPlayerId"`
+	Status        GameStatus  `json:"status"`
+	Winner        *GameWinner `json:"winner,omitempty"`
+	FEN           string      `json:"fen"`
+	PGN           string      `json:"pgn"`
+	TimeControl   string      `json:"timeControl"`
+	GameType      string      `json:"gameType"`
+	CreatedAt     time.Time   `json:"createdAt"`
+	UpdatedAt     time.Time   `json:"updatedAt"`
+
+	WhiteTimeMs  int64      `json:"whiteTimeMs"`
+	BlackTimeMs  int64      `json:"blackTimeMs"`
+	IncrementMs  int64      `json:"incrementMs"`
+	LastMoveTime *time.Time `json:"lastMoveTime,omitempty"`
+
+	engineGame *chess.Game
+}
+
+func parseClock(tc string) (int64, int64) {
+	if tc == "" {
+		return 10 * 60 * 1000, 0 // default 10|0
+	}
+	parts := strings.Split(tc, "|")
+	if len(parts) == 0 {
+		return 10 * 60 * 1000, 0
+	}
+	baseMins, _ := strconv.ParseInt(parts[0], 10, 64)
+	baseMs := baseMins * 60 * 1000
+	var incMs int64 = 0
+	if len(parts) > 1 {
+		incSecs, _ := strconv.ParseInt(parts[1], 10, 64)
+		incMs = incSecs * 1000
+	}
+	return baseMs, incMs
+}
+
+func NewChessGame(id string, whitePlayerID string, timeControl string, gameType string) *ChessGame {
+	g := chess.NewGame()
+	baseMs, incMs := parseClock(timeControl)
+	return &ChessGame{
+		ID:            id,
+		WhitePlayerID: whitePlayerID,
+		Status:        StatusWaiting,
+		FEN:           g.FEN(),
+		PGN:           "",
+		TimeControl:   timeControl,
+		GameType:      gameType,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		WhiteTimeMs:   baseMs,
+		BlackTimeMs:   baseMs,
+		IncrementMs:   incMs,
+		engineGame:    g,
+	}
+}
+
+func LoadChessGame(id, whitePlayerID, blackPlayerID, fen, pgn string, status GameStatus, winner *GameWinner, timeControl string, gameType string, createdAt, updatedAt time.Time, whiteTimeMs, blackTimeMs, incrementMs int64, lastMoveTime *time.Time) (*ChessGame, error) {
+	var opts []func(*chess.Game)
+	if fen != "" {
+		f, err := chess.FEN(fen)
+		if err != nil {
+			return nil, fmt.Errorf("invalid FEN: %w", err)
+		}
+		opts = append(opts, f)
+	}
+
+	g := chess.NewGame(opts...)
+	
+	// Backward compatibility for DB loads without clocks
+	if whiteTimeMs == 0 && blackTimeMs == 0 {
+		base, inc := parseClock(timeControl)
+		whiteTimeMs = base
+		blackTimeMs = base
+		incrementMs = inc
+	}
+	
+	return &ChessGame{
+		ID:            id,
+		WhitePlayerID: whitePlayerID,
+		BlackPlayerID: blackPlayerID,
+		Status:        status,
+		Winner:        winner,
+		FEN:           fen,
+		PGN:           pgn,
+		TimeControl:   timeControl,
+		GameType:      gameType,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
+		WhiteTimeMs:   whiteTimeMs,
+		BlackTimeMs:   blackTimeMs,
+		IncrementMs:   incrementMs,
+		LastMoveTime:  lastMoveTime,
+		engineGame:    g,
+	}, nil
+}
+
+func (cg *ChessGame) CheckFlag(now time.Time) bool {
+	if cg.Status != StatusInProgress || cg.LastMoveTime == nil {
+		return false
+	}
+	elapsed := now.Sub(*cg.LastMoveTime).Milliseconds()
+	turn := cg.engineGame.Position().Turn()
+	if turn == chess.White {
+		return cg.WhiteTimeMs-elapsed <= 0
+	}
+	return cg.BlackTimeMs-elapsed <= 0
+}
+
+func (cg *ChessGame) Flag(now time.Time) {
+	if cg.Status != StatusInProgress {
+		return
+	}
+	cg.Status = StatusCompleted
+	var winner GameWinner
+	if cg.engineGame.Position().Turn() == chess.White {
+		winner = WinnerBlack
+		cg.WhiteTimeMs = 0
+	} else {
+		winner = WinnerWhite
+		cg.BlackTimeMs = 0
+	}
+	cg.Winner = &winner
+	cg.UpdatedAt = now
+}
+
+func (cg *ChessGame) MakeMove(playerID string, moveStr string) error {
+	if cg.Status != StatusInProgress {
+		return errors.New("game is not in progress")
+	}
+
+	turn := cg.engineGame.Position().Turn()
+	if turn == chess.White && playerID != cg.WhitePlayerID {
+		return errors.New("not your turn (white's turn)")
+	}
+	if turn == chess.Black && playerID != cg.BlackPlayerID {
+		return errors.New("not your turn (black's turn)")
+	}
+
+	now := time.Now()
+	if cg.CheckFlag(now) {
+		cg.Flag(now)
+		return errors.New("flagged (timeout)")
+	}
+
+	var move *chess.Move
+	var decodeErr error
+
+	uciNotation := chess.UCINotation{}
+	move, decodeErr = uciNotation.Decode(cg.engineGame.Position(), moveStr)
+
+	if decodeErr != nil {
+		algebraicNotation := chess.AlgebraicNotation{}
+		move, decodeErr = algebraicNotation.Decode(cg.engineGame.Position(), moveStr)
+	}
+
+	if decodeErr != nil {
+		return fmt.Errorf("invalid move format '%s': %w", moveStr, decodeErr)
+	}
+
+	if err := cg.engineGame.Move(move); err != nil {
+		return fmt.Errorf("illegal move: %w", err)
+	}
+
+	// Clock management
+	if cg.LastMoveTime != nil {
+		elapsed := now.Sub(*cg.LastMoveTime).Milliseconds()
+		// Lag compensation: deduct up to 400ms (assumed RTT compensation)
+		compensated := elapsed - 400
+		if compensated < 0 {
+			compensated = 0
+		}
+		
+		if turn == chess.White {
+			cg.WhiteTimeMs -= compensated
+			cg.WhiteTimeMs += cg.IncrementMs
+		} else {
+			cg.BlackTimeMs -= compensated
+			cg.BlackTimeMs += cg.IncrementMs
+		}
+	}
+	
+	cg.LastMoveTime = &now
+	cg.FEN = cg.engineGame.FEN()
+	cg.PGN = cg.engineGame.String()
+	cg.UpdatedAt = now
+
+	cg.updateOutcome()
+
+	return nil
+}
+
+func (cg *ChessGame) Start(blackPlayerID string) error {
+	if cg.Status != StatusWaiting {
+		return errors.New("game cannot be started from its current status")
+	}
+	cg.BlackPlayerID = blackPlayerID
+	cg.Status = StatusInProgress
+	cg.UpdatedAt = time.Now()
+	return nil
+}
+
+func (cg *ChessGame) Resign(playerID string) error {
+	if cg.Status != StatusInProgress {
+		return errors.New("game is not in progress")
+	}
+
+	var winner GameWinner
+	if playerID == cg.WhitePlayerID {
+		winner = WinnerBlack
+	} else if playerID == cg.BlackPlayerID {
+		winner = WinnerWhite
+	} else {
+		return errors.New("player is not in this game")
+	}
+
+	cg.Status = StatusCompleted
+	cg.Winner = &winner
+	cg.UpdatedAt = time.Now()
+	return nil
+}
+
+func (cg *ChessGame) updateOutcome() {
+	outcome := cg.engineGame.Outcome()
+	if outcome == chess.NoOutcome {
+		return
+	}
+
+	cg.Status = StatusCompleted
+	switch outcome {
+	case chess.WhiteWon:
+		w := WinnerWhite
+		cg.Winner = &w
+	case chess.BlackWon:
+		w := WinnerBlack
+		cg.Winner = &w
+	case chess.Draw:
+		cg.Status = StatusDraw
+		w := WinnerDraw
+		cg.Winner = &w
+	}
+}
+
+func (cg *ChessGame) CurrentTurnPlayerID() string {
+	if cg.engineGame.Position().Turn() == chess.White {
+		return cg.WhitePlayerID
+	}
+	return cg.BlackPlayerID
+}
+
+func (cg *ChessGame) MovesCount() int {
+	return len(cg.engineGame.Moves())
+}
