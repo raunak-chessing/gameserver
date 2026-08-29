@@ -59,6 +59,13 @@ func (r *RedisClient) SubscribeGameEvent(ctx context.Context, gameID string) *re
 	return r.client.SSubscribe(ctx, channel)
 }
 
+func (r *RedisClient) PublishGlobalEvent(ctx context.Context, channel string, payload []byte) error {
+	if err := r.client.Publish(ctx, channel, payload).Err(); err != nil {
+		return fmt.Errorf("failed to publish to Redis channel %s: %w", channel, err)
+	}
+	return nil
+}
+
 func (r *RedisClient) CacheGameState(ctx context.Context, gameID string, fen string, expiration time.Duration) error {
 	key := fmt.Sprintf("game_state:%s", gameID)
 	err := r.client.Set(ctx, key, fen, expiration).Err()

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +15,27 @@ import (
 	"gameserver/internal/domain"
 	"gameserver/internal/infrastructure/cache"
 	"gameserver/internal/infrastructure/db"
+	"gameserver/internal/metrics"
+
+	"github.com/getsentry/sentry-go"
+)
+
+func recoverAndLog(goroutine string) {
+	if r := recover(); r != nil {
+		log.Printf("recovered from panic in %s: %v\n%s", goroutine, r, debug.Stack())
+		sentry.CurrentHub().Recover(r)
+		sentry.Flush(2 * time.Second)
+	}
+}
+
+const (
+	gameEventChanBuffer       = 500
+	matchmakingWaitTimeout    = 5 * time.Minute
+	sessionIdleTimeout        = 5 * time.Minute
+	abandonTimeout            = 60 * time.Second
+	flagCheckInterval         = 24 * time.Hour
+	stalledSessionSendTimeout = 2 * time.Second
+	gameEndedEventsChannel    = "gameserver:events"
 )
 
 type GameShard struct {
@@ -59,6 +80,18 @@ type Hub struct {
 	db          *db.DB
 }
 
+// ActiveGameSessionCount returns the number of in-memory game sessions
+// currently held across all shards on this instance.
+func (h *Hub) ActiveGameSessionCount() int {
+	count := 0
+	for _, shard := range h.shardedGames.shards {
+		shard.mu.RLock()
+		count += len(shard.games)
+		shard.mu.RUnlock()
+	}
+	return count
+}
+
 func NewHub(
 	matchmaker *application.Matchmaker,
 	gameService *application.GameService,
@@ -82,7 +115,11 @@ func (h *Hub) Run(ctx context.Context) {
 		select {
 		case client := <-h.Register:
 			h.clientsMu.Lock()
-			if oldClient, exists := h.clients[client.player.ID]; exists {
+			oldClient, exists := h.clients[client.player.ID]
+			h.clients[client.player.ID] = client
+			h.clientsMu.Unlock()
+
+			if exists {
 				oldClient.SendJSON(&ServerMessage{
 					Type: "disconnect",
 					Payload: map[string]string{
@@ -91,8 +128,6 @@ func (h *Hub) Run(ctx context.Context) {
 				})
 				oldClient.conn.Close()
 			}
-			h.clients[client.player.ID] = client
-			h.clientsMu.Unlock()
 			log.Printf("Player connected: %s (%s)", client.player.Name, client.player.ID)
 
 		case client := <-h.Unregister:
@@ -114,30 +149,45 @@ func (h *Hub) Run(ctx context.Context) {
 func (h *Hub) HandleMessage(c *Client, msg *ClientMessage) {
 	switch msg.Type {
 	case "join_matchmaking":
+		if c.player.IsFlaggedForCheating {
+			c.SendJSON(&ServerMessage{
+				Type:    "error",
+				Payload: "Your account has been flagged for fair play violations. You cannot join matchmaking.",
+			})
+			return
+		}
+
 		var payload struct {
 			TimeControl string `json:"timeControl"`
+			Variant     string `json:"variant"`
 		}
 		_ = json.Unmarshal(msg.Payload, &payload)
 
 		timeControl, gameType := ParseTimeControl(payload.TimeControl)
 		rating := getPlayerRatingForType(c.player, gameType)
+		variant := parseGameVariant(payload.Variant)
 
-		replyChan := h.matchmaker.Join(c.player.ID, rating, timeControl, gameType)
+		replyChan := h.matchmaker.Join(c.player.ID, rating, timeControl, gameType, variant)
 		go func() {
+			defer recoverAndLog("matchmaking wait goroutine")
 			select {
 			case res, ok := <-replyChan:
 				if ok && res != nil {
-					c.SendJSON(&ServerMessage{
-						Type:   "match_found",
-						GameID: res.GameID,
-						Payload: map[string]string{
-							"gameId":        res.GameID,
-							"whitePlayerId": res.WhitePlayerID,
-							"blackPlayerId": res.BlackPlayerID,
-						},
-					})
+					if res.Err != "" {
+						c.SendError(res.Err)
+					} else {
+						c.SendJSON(&ServerMessage{
+							Type:   "match_found",
+							GameID: res.GameID,
+							Payload: map[string]string{
+								"gameId":        res.GameID,
+								"whitePlayerId": res.WhitePlayerID,
+								"blackPlayerId": res.BlackPlayerID,
+							},
+						})
+					}
 				}
-			case <-time.After(5 * time.Minute):
+			case <-time.After(matchmakingWaitTimeout):
 				h.matchmaker.Leave(c.player.ID)
 				c.SendError("Matchmaking timeout")
 			}
@@ -146,6 +196,17 @@ func (h *Hub) HandleMessage(c *Client, msg *ClientMessage) {
 	case "leave_matchmaking":
 		h.matchmaker.Leave(c.player.ID)
 		c.SendJSON(&ServerMessage{Type: "left_matchmaking"})
+
+	case "sendGameMessage":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventChat,
+			PlayerID: c.player.ID,
+			Payload:  msg.Payload,
+		})
 
 	case "join_game":
 		if msg.GameID == "" {
@@ -176,6 +237,106 @@ func (h *Hub) HandleMessage(c *Client, msg *ClientMessage) {
 			Payload:  msg.Payload,
 		})
 
+	case "abort":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventAbort,
+			PlayerID: c.player.ID,
+		})
+
+	case "requestRematch":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventRequestRematch,
+			PlayerID: c.player.ID,
+		})
+
+	case "acceptRematch":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventAcceptRematch,
+			PlayerID: c.player.ID,
+		})
+
+	case "declineRematch":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventDeclineRematch,
+			PlayerID: c.player.ID,
+		})
+
+	case "requestUndo":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventRequestUndo,
+			PlayerID: c.player.ID,
+		})
+
+	case "acceptUndo":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventAcceptUndo,
+			PlayerID: c.player.ID,
+		})
+
+	case "declineUndo":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventDeclineUndo,
+			PlayerID: c.player.ID,
+		})
+
+	case "offer_draw":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventOfferDraw,
+			PlayerID: c.player.ID,
+		})
+
+	case "accept_draw":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventAcceptDraw,
+			PlayerID: c.player.ID,
+		})
+
+	case "decline_draw":
+		if msg.GameID == "" {
+			c.SendError("Missing gameId")
+			return
+		}
+		h.forwardToGame(msg.GameID, &GameSessionEvent{
+			Type:     EventDeclineDraw,
+			PlayerID: c.player.ID,
+		})
+
 	default:
 		c.SendError(fmt.Sprintf("Unknown action: %s", msg.Type))
 	}
@@ -195,7 +356,10 @@ func (h *Hub) joinGameSession(c *Client, gameID string) {
 
 		session = NewGameSession(gameID, g, h.gameService, h.redis, h)
 		shard.games[gameID] = session
-		go session.Run(context.Background())
+		go func() {
+			defer recoverAndLog(fmt.Sprintf("game session %s", gameID))
+			session.Run(context.Background())
+		}()
 	}
 	shard.mu.Unlock()
 
@@ -208,10 +372,15 @@ func (h *Hub) forwardToGame(gameID string, event *GameSessionEvent) {
 	session, exists := shard.games[gameID]
 	shard.mu.RUnlock()
 
-	if exists {
-		session.eventChan <- event
-	} else {
-		log.Printf("Warning: received move for game %s but no active session found locally", gameID)
+	if !exists {
+		log.Printf("Warning: received event for game %s but no active session found locally", gameID)
+		return
+	}
+
+	select {
+	case session.eventChan <- event:
+	case <-time.After(stalledSessionSendTimeout):
+		log.Printf("Warning: dropped event type %v for stalled game session %s", event.Type, gameID)
 	}
 }
 
@@ -226,11 +395,22 @@ func (h *Hub) removeGameSession(gameID string) {
 type GameEventType string
 
 const (
-	EventJoin       GameEventType = "join"
-	EventLeave      GameEventType = "leave"
-	EventMove       GameEventType = "move"
-	EventResign     GameEventType = "resign"
-	EventRemoteSync GameEventType = "remote_sync"
+	EventJoin           GameEventType = "join"
+	EventLeave          GameEventType = "leave"
+	EventMove           GameEventType = "move"
+	EventResign         GameEventType = "resign"
+	EventAbort          GameEventType = "abort"
+	EventOfferDraw      GameEventType = "offer_draw"
+	EventAcceptDraw     GameEventType = "accept_draw"
+	EventDeclineDraw    GameEventType = "decline_draw"
+	EventRequestRematch GameEventType = "request_rematch"
+	EventAcceptRematch  GameEventType = "accept_rematch"
+	EventDeclineRematch GameEventType = "decline_rematch"
+	EventRequestUndo    GameEventType = "request_undo"
+	EventAcceptUndo     GameEventType = "accept_undo"
+	EventDeclineUndo    GameEventType = "decline_undo"
+	EventRemoteSync     GameEventType = "remote_sync"
+	EventChat           GameEventType = "chat"
 )
 
 type GameSessionEvent struct {
@@ -263,7 +443,7 @@ func NewGameSession(
 		gameService: gameService,
 		redis:       redis,
 		hub:         hub,
-		eventChan:   make(chan *GameSessionEvent, 100),
+		eventChan:   make(chan *GameSessionEvent, gameEventChanBuffer),
 		clients:     make(map[string]*Client),
 	}
 }
@@ -286,15 +466,23 @@ func (s *GameSession) Run(ctx context.Context) {
 	redisChan := pubsub.Channel()
 
 	go func() {
+		defer recoverAndLog(fmt.Sprintf("redis pubsub consumer for game %s", s.id))
 		for {
 			select {
 			case msg, ok := <-redisChan:
 				if !ok {
 					return
 				}
-				s.eventChan <- &GameSessionEvent{
+				event := &GameSessionEvent{
 					Type:    EventRemoteSync,
 					Payload: json.RawMessage(msg.Payload),
+				}
+				select {
+				case s.eventChan <- event:
+				case <-time.After(stalledSessionSendTimeout):
+					log.Printf("Warning: dropped remote sync event for stalled game session %s", s.id)
+				case <-ctx.Done():
+					return
 				}
 			case <-ctx.Done():
 				return
@@ -302,13 +490,13 @@ func (s *GameSession) Run(ctx context.Context) {
 		}
 	}()
 
-	idleTimer := time.NewTimer(5 * time.Minute)
+	idleTimer := time.NewTimer(sessionIdleTimeout)
 	defer idleTimer.Stop()
-	
-	abandonTimer := time.NewTimer(60 * time.Second)
+
+	abandonTimer := time.NewTimer(abandonTimeout)
 	abandonTimer.Stop()
 
-	flagTimer := time.NewTimer(time.Hour * 24)
+	flagTimer := time.NewTimer(flagCheckInterval)
 	flagTimer.Stop()
 
 	resetFlagTimer := func() {
@@ -316,7 +504,7 @@ func (s *GameSession) Run(ctx context.Context) {
 			flagTimer.Stop()
 			return
 		}
-		
+
 		turn := s.game.CurrentTurnPlayerID()
 		var remMs int64
 		if turn == s.game.WhitePlayerID {
@@ -324,10 +512,10 @@ func (s *GameSession) Run(ctx context.Context) {
 		} else {
 			remMs = s.game.BlackTimeMs
 		}
-		
+
 		now := time.Now()
 		elapsed := now.Sub(*s.game.LastMoveTime).Milliseconds()
-		timeLeft := time.Duration(remMs - elapsed) * time.Millisecond
+		timeLeft := time.Duration(remMs-elapsed) * time.Millisecond
 		if timeLeft <= 0 {
 			timeLeft = 0
 		}
@@ -343,16 +531,16 @@ func (s *GameSession) Run(ctx context.Context) {
 				default:
 				}
 			}
-			idleTimer.Reset(5 * time.Minute)
+			idleTimer.Reset(sessionIdleTimeout)
 
 			s.handleEvent(ctx, event)
 
 			s.clientsMu.Lock()
 			count := len(s.clients)
 			s.clientsMu.Unlock()
-			
+
 			if count == 0 {
-				abandonTimer.Reset(60 * time.Second)
+				abandonTimer.Reset(abandonTimeout)
 			} else {
 				if !abandonTimer.Stop() {
 					select {
@@ -363,12 +551,14 @@ func (s *GameSession) Run(ctx context.Context) {
 			}
 
 			if s.game.Status == domain.StatusCompleted || s.game.Status == domain.StatusDraw {
-				s.updateRatings(ctx)
-				time.Sleep(1 * time.Second)
-				s.hub.removeGameSession(s.id)
+				application.UpdateRatings(ctx, s.hub.db, s.game, s.id)
+				s.publishGameEnded(ctx)
+				time.AfterFunc(1*time.Second, func() {
+					s.hub.removeGameSession(s.id)
+				})
 				return
 			}
-			
+
 			resetFlagTimer()
 
 		case <-flagTimer.C:
@@ -376,13 +566,13 @@ func (s *GameSession) Run(ctx context.Context) {
 			if s.game.CheckFlag(now) {
 				s.game.Flag(now)
 				_ = s.gameService.SaveGame(ctx, s.game)
-				
+
 				var winnerStr *string
 				if s.game.Winner != nil {
 					str := string(*s.game.Winner)
 					winnerStr = &str
 				}
-				
+
 				broadcastPayload, _ := json.Marshal(map[string]interface{}{
 					"type":   "game_over",
 					"gameId": s.id,
@@ -393,16 +583,18 @@ func (s *GameSession) Run(ctx context.Context) {
 						"reason": "Timeout",
 					},
 				})
-				_ = s.redis.PublishGameEvent(ctx, s.id, broadcastPayload)
-				
-				s.updateRatings(ctx)
-				time.Sleep(1 * time.Second)
-				s.hub.removeGameSession(s.id)
+				s.publishOrLog(ctx, broadcastPayload)
+
+				application.UpdateRatings(ctx, s.hub.db, s.game, s.id)
+				s.publishGameEnded(ctx)
+				time.AfterFunc(1*time.Second, func() {
+					s.hub.removeGameSession(s.id)
+				})
 				return
 			} else {
 				resetFlagTimer()
 			}
-			
+
 		case <-abandonTimer.C:
 			log.Printf("Game session %s abandoned by players", s.id)
 			// Automatically draw or give win to remaining player if applicable, for simplicity just abort here
@@ -452,6 +644,7 @@ func (s *GameSession) handleEvent(ctx context.Context, event *GameSessionEvent) 
 					"winner":              winnerStr,
 					"timeControl":         s.game.TimeControl,
 					"gameType":            s.game.GameType,
+					"variant":             s.game.Variant,
 					"whitePlayerId":       s.game.WhitePlayerID,
 					"blackPlayerId":       s.game.BlackPlayerID,
 					"serverWhiteMs":       s.game.WhiteTimeMs,
@@ -475,6 +668,7 @@ func (s *GameSession) handleEvent(ctx context.Context, event *GameSessionEvent) 
 			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: err.Error()})
 			return
 		}
+		metrics.MovesProcessed.Inc()
 
 		if err := s.gameService.SaveGame(ctx, s.game); err != nil {
 			log.Printf("Failed to save game state: %v", err)
@@ -495,12 +689,14 @@ func (s *GameSession) handleEvent(ctx context.Context, event *GameSessionEvent) 
 				"pgn":                 s.game.PGN,
 				"status":              s.game.Status,
 				"winner":              winnerStr,
+				"whiteChecks":         s.game.WhiteChecks,
+				"blackChecks":         s.game.BlackChecks,
 				"serverWhiteMs":       s.game.WhiteTimeMs,
 				"serverBlackMs":       s.game.BlackTimeMs,
 				"serverSyncTimestamp": time.Now().UnixMilli(),
 			},
 		})
-		_ = s.redis.PublishGameEvent(ctx, s.id, broadcastPayload)
+		s.publishOrLog(ctx, broadcastPayload)
 
 	case EventResign:
 		err := s.game.Resign(event.PlayerID)
@@ -528,7 +724,195 @@ func (s *GameSession) handleEvent(ctx context.Context, event *GameSessionEvent) 
 				"reason": fmt.Sprintf("Player %s resigned", event.PlayerID),
 			},
 		})
-		_ = s.redis.PublishGameEvent(ctx, s.id, broadcastPayload)
+		s.publishOrLog(ctx, broadcastPayload)
+
+	case EventAbort:
+		if s.game.MovesCount() > 0 {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: "Cannot abort game after moves have been played"})
+			return
+		}
+		err := s.game.Abort()
+		if err != nil {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: err.Error()})
+			return
+		}
+
+		if err := s.gameService.SaveGame(ctx, s.game); err != nil {
+			log.Printf("Failed to save game state: %v", err)
+		}
+
+		broadcastPayload, _ := json.Marshal(map[string]interface{}{
+			"type":   "game_aborted",
+			"gameId": s.id,
+			"sender": event.PlayerID,
+			"payload": map[string]interface{}{
+				"status": s.game.Status,
+				"reason": fmt.Sprintf("Player %s aborted the game", event.PlayerID),
+			},
+		})
+		s.publishOrLog(ctx, broadcastPayload)
+
+	case EventOfferDraw:
+		broadcastPayload, _ := json.Marshal(map[string]interface{}{
+			"type":   "draw_offered",
+			"gameId": s.id,
+			"sender": event.PlayerID,
+		})
+		s.publishOrLog(ctx, broadcastPayload)
+
+	case EventAcceptDraw:
+		if event.PlayerID != s.game.WhitePlayerID && event.PlayerID != s.game.BlackPlayerID {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: "Not a player in this game"})
+			return
+		}
+
+		err := s.game.Draw()
+		if err != nil {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: err.Error()})
+			return
+		}
+
+		if err := s.gameService.SaveGame(ctx, s.game); err != nil {
+			log.Printf("Failed to save game state: %v", err)
+		}
+
+		var winnerStr *string
+		if s.game.Winner != nil {
+			str := string(*s.game.Winner)
+			winnerStr = &str
+		}
+		broadcastPayload, _ := json.Marshal(map[string]interface{}{
+			"type":   "game_over",
+			"gameId": s.id,
+			"sender": event.PlayerID,
+			"payload": map[string]interface{}{
+				"status": s.game.Status,
+				"winner": winnerStr,
+				"reason": "Draw by agreement",
+			},
+		})
+		s.publishOrLog(ctx, broadcastPayload)
+
+	case EventDeclineDraw:
+		broadcastPayload, _ := json.Marshal(map[string]interface{}{
+			"type":   "draw_declined",
+			"gameId": s.id,
+			"sender": event.PlayerID,
+		})
+		s.publishOrLog(ctx, broadcastPayload)
+
+	case EventRequestUndo:
+		opponentID, ok := s.opponentOf(event.PlayerID)
+		if !ok {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: "Not a player in this game"})
+			return
+		}
+		s.sendToPlayer(opponentID, &ServerMessage{Type: "undoRequested", GameID: s.id})
+
+	case EventDeclineUndo:
+		opponentID, ok := s.opponentOf(event.PlayerID)
+		if !ok {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: "Not a player in this game"})
+			return
+		}
+		s.sendToPlayer(opponentID, &ServerMessage{Type: "undoDeclined", GameID: s.id})
+
+	case EventAcceptUndo:
+		if event.PlayerID != s.game.WhitePlayerID && event.PlayerID != s.game.BlackPlayerID {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: "Not a player in this game"})
+			return
+		}
+
+		if err := s.game.UndoLastMove(); err != nil {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: err.Error()})
+			return
+		}
+
+		if err := s.gameService.SaveGame(ctx, s.game); err != nil {
+			log.Printf("Failed to save game state: %v", err)
+		}
+
+		broadcastPayload, _ := json.Marshal(map[string]interface{}{
+			"type":   "opponentUndo",
+			"gameId": s.id,
+			"sender": event.PlayerID,
+			"payload": map[string]interface{}{
+				"fen": s.game.FEN,
+				"pgn": s.game.PGN,
+			},
+		})
+		s.publishOrLog(ctx, broadcastPayload)
+
+	case EventRequestRematch:
+		broadcastPayload, _ := json.Marshal(map[string]interface{}{
+			"type":   "rematchRequested",
+			"gameId": s.id,
+			"sender": event.PlayerID,
+		})
+		s.publishOrLog(ctx, broadcastPayload)
+
+	case EventDeclineRematch:
+		broadcastPayload, _ := json.Marshal(map[string]interface{}{
+			"type":   "rematch_declined",
+			"gameId": s.id,
+			"sender": event.PlayerID,
+		})
+		s.publishOrLog(ctx, broadcastPayload)
+
+	case EventChat:
+		var payload struct {
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: "Invalid chat payload"})
+			return
+		}
+
+		p, err := s.hub.db.GetPlayer(ctx, event.PlayerID)
+		if err != nil {
+			return
+		}
+
+		broadcastPayload, _ := json.Marshal(map[string]interface{}{
+			"type":   "gameMessage",
+			"gameId": s.id,
+			"payload": map[string]interface{}{
+				"sender":    p.Name,
+				"message":   payload.Message,
+				"timestamp": time.Now().Format(time.RFC3339),
+			},
+		})
+		s.publishOrLog(ctx, broadcastPayload)
+
+	case EventAcceptRematch:
+		if event.PlayerID != s.game.WhitePlayerID && event.PlayerID != s.game.BlackPlayerID {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: "Not a player in this game"})
+			return
+		}
+		// Create new game swapping colors
+		newGameID, err := s.gameService.CreateNewGame(
+			ctx,
+			s.game.BlackPlayerID, // new white
+			s.game.WhitePlayerID, // new black
+			s.game.TimeControl,
+			s.game.GameType,
+			s.game.Variant,
+		)
+		if err != nil {
+			s.sendToPlayer(event.PlayerID, &ServerMessage{Type: "error", Payload: "Failed to create rematch game"})
+			log.Printf("Failed to create rematch game: %v", err)
+			return
+		}
+
+		broadcastPayload, _ := json.Marshal(map[string]interface{}{
+			"type":   "rematchAccepted",
+			"gameId": s.id,
+			"sender": event.PlayerID,
+			"payload": map[string]interface{}{
+				"newGameId": newGameID,
+			},
+		})
+		s.publishOrLog(ctx, broadcastPayload)
 
 	case EventRemoteSync:
 		var msg struct {
@@ -540,6 +924,8 @@ func (s *GameSession) handleEvent(ctx context.Context, event *GameSessionEvent) 
 			return
 		}
 
+		syncOK := true
+
 		if msg.Type == "move_made" {
 			var movePayload struct {
 				Move          string            `json:"move"`
@@ -547,6 +933,8 @@ func (s *GameSession) handleEvent(ctx context.Context, event *GameSessionEvent) 
 				PGN           string            `json:"pgn"`
 				Status        domain.GameStatus `json:"status"`
 				Winner        *string           `json:"winner"`
+				WhiteChecks   int               `json:"whiteChecks"`
+				BlackChecks   int               `json:"blackChecks"`
 				ServerWhiteMs int64             `json:"serverWhiteMs"`
 				ServerBlackMs int64             `json:"serverBlackMs"`
 			}
@@ -556,7 +944,7 @@ func (s *GameSession) handleEvent(ctx context.Context, event *GameSessionEvent) 
 					w := domain.GameWinner(*movePayload.Winner)
 					winner = &w
 				}
-				
+
 				wTimeMs := movePayload.ServerWhiteMs
 				if wTimeMs == 0 {
 					wTimeMs = s.game.WhiteTimeMs
@@ -567,31 +955,55 @@ func (s *GameSession) handleEvent(ctx context.Context, event *GameSessionEvent) 
 				}
 
 				now := time.Now()
-				s.game, _ = domain.LoadChessGame(
-					s.id,
-					s.game.WhitePlayerID,
-					s.game.BlackPlayerID,
-					movePayload.FEN,
-					movePayload.PGN,
-					s.game.Status,
-					winner,
-					s.game.TimeControl,
-					s.game.GameType,
-					s.game.CreatedAt,
-					now,
-					wTimeMs,
-					bTimeMs,
-					s.game.IncrementMs,
-					&now,
-				)
+				reloaded, loadErr := domain.LoadChessGame(domain.LoadChessGameParams{
+					ID:            s.id,
+					WhitePlayerID: s.game.WhitePlayerID,
+					BlackPlayerID: s.game.BlackPlayerID,
+					FEN:           movePayload.FEN,
+					PGN:           movePayload.PGN,
+					Status:        s.game.Status,
+					Winner:        winner,
+					TimeControl:   s.game.TimeControl,
+					GameType:      s.game.GameType,
+					Variant:       s.game.Variant,
+					WhiteChecks:   movePayload.WhiteChecks,
+					BlackChecks:   movePayload.BlackChecks,
+					CreatedAt:     s.game.CreatedAt,
+					UpdatedAt:     now,
+					WhiteTimeMs:   wTimeMs,
+					BlackTimeMs:   bTimeMs,
+					IncrementMs:   s.game.IncrementMs,
+					LastMoveTime:  &now,
+				})
+				if loadErr != nil {
+					log.Printf("Failed to apply remote sync for game %s: %v", s.id, loadErr)
+					syncOK = false
+				} else {
+					s.game = reloaded
+				}
+			} else {
+				syncOK = false
 			}
 		}
 
-		s.broadcastLocal(&ServerMessage{
-			Type:    msg.Type,
-			GameID:  s.id,
-			Payload: msg.Payload,
-		})
+		if syncOK {
+			s.broadcastLocal(&ServerMessage{
+				Type:    msg.Type,
+				GameID:  s.id,
+				Payload: msg.Payload,
+			})
+		}
+	}
+}
+
+func (s *GameSession) opponentOf(playerID string) (string, bool) {
+	switch playerID {
+	case s.game.WhitePlayerID:
+		return s.game.BlackPlayerID, true
+	case s.game.BlackPlayerID:
+		return s.game.WhitePlayerID, true
+	default:
+		return "", false
 	}
 }
 
@@ -614,124 +1026,32 @@ func (s *GameSession) broadcastLocal(msg *ServerMessage) {
 	}
 }
 
-// updateRatings processes Glicko-1 updates for both players
-func (s *GameSession) updateRatings(ctx context.Context) {
-	if s.game.WhitePlayerID == "" || s.game.BlackPlayerID == "" {
-		return
+func (s *GameSession) publishOrLog(ctx context.Context, payload []byte) {
+	if err := s.redis.PublishGameEvent(ctx, s.id, payload); err != nil {
+		log.Printf("Failed to publish game event for game %s: %v", s.id, err)
 	}
+}
 
-	// Under chess.com rules, a game is aborted if ended before both players made their first move.
-	// We check if history has less than 2 moves (White move 1 + Black move 1).
-	if s.game.MovesCount() < 2 {
-		log.Printf("Game %s aborted (moves %d < 2). Ratings are unaffected.", s.id, s.game.MovesCount())
-		return
-	}
-
-	pA, err := s.hub.db.GetPlayer(ctx, s.game.WhitePlayerID)
-	if err != nil {
-		log.Printf("Failed to load player A (%s) for rating update: %v", s.game.WhitePlayerID, err)
-		return
-	}
-
-	pB, err := s.hub.db.GetPlayer(ctx, s.game.BlackPlayerID)
-	if err != nil {
-		log.Printf("Failed to load player B (%s) for rating update: %v", s.game.BlackPlayerID, err)
-		return
-	}
-
-	var rA, rdA float64
-	var rB, rdB float64
-	var lastActiveA, lastActiveB time.Time
-
-	switch s.game.GameType {
-	case "BULLET":
-		rA = float64(pA.RatingBullet)
-		rdA = pA.RDBullet
-		lastActiveA = pA.LastActiveBullet
-		rB = float64(pB.RatingBullet)
-		rdB = pB.RDBullet
-		lastActiveB = pB.LastActiveBullet
-	case "BLITZ":
-		rA = float64(pA.RatingBlitz)
-		rdA = pA.RDBlitz
-		lastActiveA = pA.LastActiveBlitz
-		rB = float64(pB.RatingBlitz)
-		rdB = pB.RDBlitz
-		lastActiveB = pB.LastActiveBlitz
-	case "DAILY":
-		rA = float64(pA.RatingDaily)
-		rdA = pA.RDDaily
-		lastActiveA = pA.LastActiveDaily
-		rB = float64(pB.RatingDaily)
-		rdB = pB.RDDaily
-		lastActiveB = pB.LastActiveDaily
-	default: // RAPID
-		rA = float64(pA.RatingRapid)
-		rdA = pA.RDRapid
-		lastActiveA = pA.LastActiveRapid
-		rB = float64(pB.RatingRapid)
-		rdB = pB.RDRapid
-		lastActiveB = pB.LastActiveRapid
-	}
-
-	rdA = domain.DecayRD(rdA, lastActiveA)
-	rdB = domain.DecayRD(rdB, lastActiveB)
-
-	outcomeA := 0.5
+func (s *GameSession) publishGameEnded(ctx context.Context) {
+	var winner *string
 	if s.game.Winner != nil {
-		if *s.game.Winner == domain.WinnerWhite {
-			outcomeA = 1.0
-		} else if *s.game.Winner == domain.WinnerBlack {
-			outcomeA = 0.0
-		}
-	}
-	outcomeB := 1.0 - outcomeA
-
-	newRA, newRDA := domain.CalculateNewRatingAndRD(rA, rdA, rB, rdB, outcomeA)
-	newRB, newRDB := domain.CalculateNewRatingAndRD(rB, rdB, rA, rdA, outcomeB)
-
-	now := time.Now()
-	switch s.game.GameType {
-	case "BULLET":
-		pA.RatingBullet = int(math.Round(newRA))
-		pA.RDBullet = newRDA
-		pA.LastActiveBullet = now
-		pB.RatingBullet = int(math.Round(newRB))
-		pB.RDBullet = newRDB
-		pB.LastActiveBullet = now
-	case "BLITZ":
-		pA.RatingBlitz = int(math.Round(newRA))
-		pA.RDBlitz = newRDA
-		pA.LastActiveBlitz = now
-		pB.RatingBlitz = int(math.Round(newRB))
-		pB.RDBlitz = newRDB
-		pB.LastActiveBlitz = now
-	case "DAILY":
-		pA.RatingDaily = int(math.Round(newRA))
-		pA.RDDaily = newRDA
-		pA.LastActiveDaily = now
-		pB.RatingDaily = int(math.Round(newRB))
-		pB.RDDaily = newRDB
-		pB.LastActiveDaily = now
-	default: // RAPID
-		pA.RatingRapid = int(math.Round(newRA))
-		pA.RDRapid = newRDA
-		pA.LastActiveRapid = now
-		pB.RatingRapid = int(math.Round(newRB))
-		pB.RDRapid = newRDB
-		pB.LastActiveRapid = now
+		w := string(*s.game.Winner)
+		winner = &w
 	}
 
-	pA.Rating = int(math.Round(newRA))
-	pB.Rating = int(math.Round(newRB))
-
-	if err := s.hub.db.UpdatePlayerRatings(ctx, pA, pB, s.game.GameType); err != nil {
-		log.Printf("Failed to update player ratings: %v", err)
+	payload, err := json.Marshal(map[string]interface{}{
+		"type":   "game_ended",
+		"gameId": s.id,
+		"winner": winner,
+	})
+	if err != nil {
+		log.Printf("Failed to marshal game_ended event for game %s: %v", s.id, err)
 		return
 	}
 
-	log.Printf("[Glicko-1] Game %s (%s) concluded. Player A (%s): %d -> %d, Player B (%s): %d -> %d",
-		s.id, s.game.GameType, pA.ID, int(math.Round(rA)), pA.Rating, pB.ID, int(math.Round(rB)), pB.Rating)
+	if err := s.redis.PublishGlobalEvent(ctx, gameEndedEventsChannel, payload); err != nil {
+		log.Printf("Failed to publish game_ended event for game %s: %v", s.id, err)
+	}
 }
 
 func ParseTimeControl(tc string) (string, string) {
@@ -776,6 +1096,15 @@ func ParseTimeControl(tc string) (string, string) {
 	}
 
 	return tc, gameType
+}
+
+func parseGameVariant(v string) domain.GameVariant {
+	switch domain.GameVariant(v) {
+	case domain.VariantChess960, domain.VariantThreeCheck, domain.VariantKingOfTheHill:
+		return domain.GameVariant(v)
+	default:
+		return domain.VariantStandard
+	}
 }
 
 func getPlayerRatingForType(p *domain.Player, gameType string) int {

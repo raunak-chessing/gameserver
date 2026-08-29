@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -53,7 +54,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h.hub.Register <- client
 
-	go client.ReadPump()
+	go func() {
+		defer recoverAndLog(fmt.Sprintf("ReadPump for player %s", player.ID))
+		client.ReadPump()
+	}()
 }
 
 func (h *Handler) extractToken(r *http.Request) string {
@@ -65,16 +69,11 @@ func (h *Handler) extractToken(r *http.Request) string {
 		}
 	}
 
-	queryToken := r.URL.Query().Get("token")
-	if queryToken != "" {
-		return queryToken
-	}
-
-	cookie, err := r.Cookie("better-auth.session-token")
+	cookie, err := r.Cookie("better-auth.session_token")
 	if err == nil {
 		return cookie.Value
 	}
-	cookieAlt, err := r.Cookie("session_token")
+	cookieAlt, err := r.Cookie("__Secure-better-auth.session_token")
 	if err == nil {
 		return cookieAlt.Value
 	}

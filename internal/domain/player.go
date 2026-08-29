@@ -22,4 +22,6 @@ type Player struct {
 	RatingDaily      int       `json:"ratingDaily"`
 	RDDaily          float64   `json:"rdDaily"`
 	LastActiveDaily  time.Time `json:"lastActiveDaily"`
+
+	IsFlaggedForCheating bool `json:"isFlaggedForCheating"`
 }

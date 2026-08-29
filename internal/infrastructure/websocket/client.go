@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,9 +15,10 @@ import (
 )
 
 const (
-	writeWait = 3 * time.Second
-	pongWait = 60 * time.Second
-	maxMessageSize = 4096
+	writeWait            = 3 * time.Second
+	pongWait             = 60 * time.Second
+	maxMessageSize       = 4096
+	maxMessagesPerSecond = 30
 )
 
 type simpleBufferPool struct {
@@ -38,6 +41,14 @@ func (p *simpleBufferPool) Put(v interface{}) {
 	}
 }
 
+func isAllowedOrigin(origin string) bool {
+	if origin == "http://localhost:3000" || origin == "http://localhost:3001" {
+		return true
+	}
+	envOrigin := strings.TrimSuffix(os.Getenv("FRONTEND_URL"), "/")
+	return envOrigin != "" && strings.TrimSuffix(origin, "/") == envOrigin
+}
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
@@ -49,7 +60,11 @@ var upgrader = websocket.Upgrader{
 		},
 	},
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return false
+		}
+		return isAllowedOrigin(origin)
 	},
 }
 
@@ -82,7 +97,7 @@ func (c *Client) ReadPump() {
 	if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
 		log.Printf("SetReadDeadline error: %v", err)
 	}
-	
+
 	c.conn.SetPingHandler(func(appData string) error {
 		if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
 			return err
@@ -94,10 +109,13 @@ func (c *Client) ReadPump() {
 		}
 		return c.conn.WriteMessage(websocket.PongMessage, []byte(appData))
 	})
-	
+
 	c.conn.SetPongHandler(func(string) error {
 		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
+
+	msgCount := 0
+	lastReset := time.Now()
 
 	for {
 		_, message, err := c.conn.ReadMessage()
@@ -105,6 +123,17 @@ func (c *Client) ReadPump() {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("websocket read error: %v", err)
 			}
+			break
+		}
+
+		now := time.Now()
+		if now.Sub(lastReset) > time.Second {
+			msgCount = 0
+			lastReset = now
+		}
+		msgCount++
+		if msgCount > maxMessagesPerSecond {
+			log.Printf("Rate limit exceeded for client %v", c.conn.RemoteAddr())
 			break
 		}
 

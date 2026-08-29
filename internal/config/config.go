@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log"
 	"os"
 )
 
@@ -18,12 +19,12 @@ func Load() *Config {
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgresql://postgres:postgres@localhost:5432/chessdb"
+		log.Fatal("DATABASE_URL environment variable is not set")
 	}
 
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
-		redisURL = "localhost:6379"
+		log.Fatal("REDIS_URL environment variable is not set")
 	}
 
 	return &Config{
