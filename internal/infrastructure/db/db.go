@@ -272,15 +272,27 @@ func (db *DB) GetGame(ctx context.Context, gameID string) (*domain.ChessGame, er
 }
 
 func (db *DB) SaveGame(ctx context.Context, g *domain.ChessGame) error {
+	// Snapshot the game's fields before handing it to the async batch
+	// queue. SaveGame is called from GameSession.Run() — the same
+	// goroutine that keeps mutating this *ChessGame on every subsequent
+	// move/event — while StartBatchProcessor's flush() reads a queued
+	// pointer's fields on its own goroutine up to flushInterval later.
+	// Queuing the live pointer directly is a genuine data race (confirmed
+	// with `go test -race`: concurrent write/read on FEN, PGN, WhiteTimeMs,
+	// BlackTimeMs). A shallow copy is sufficient: every field is either a
+	// value type or a pointer (Winner, LastMoveTime) that's only ever
+	// replaced wholesale, never mutated through an existing pointer.
+	snapshot := *g
+
 	queueLen := len(db.saveQueue)
 	if queueLen > saveQueueWarnThreshold {
 		log.Printf("Warning: DB save queue at %d/%d (%.0f%% capacity)", queueLen, saveQueueCapacity, float64(queueLen)/float64(saveQueueCapacity)*100)
 	}
 	select {
-	case db.saveQueue <- g:
+	case db.saveQueue <- &snapshot:
 	default:
 		log.Printf("Warning: DB save queue is full. Executing synchronous save for game %s", g.ID)
-		return db.saveGameSync(ctx, g)
+		return db.saveGameSync(ctx, &snapshot)
 	}
 	return nil
 }
